@@ -1,165 +1,269 @@
-This repo page lists down the effective installation guideline for Workstations with NVIDIA GPUs for AI/DL/NN workloads and Robotics Environment supporting frameworks such as 
-TensorFlow/Pytorch/ROS2 etc.
+# GPU Workstation Setup (NVIDIA + AI/DL + Robotics on Ubuntu LTS)
 
-Part of this process can be followed for NVIDIA Omniverse setup with ISAAC ROS and GYM capabilities.
+Install guide and utilities for Linux workstations with NVIDIA GPUs, targeting AI/DL/NN
+workloads (TensorFlow, PyTorch) and robotics environments (ROS 2, Isaac ROS/Gym, Omniverse).
 
-This installation guide targets only LINUX/UNIX Operating Systems ie. Ubuntu LTS, RHEL, etc.
+Targets Linux/UNIX only — Ubuntu LTS (22.04 / 24.04 / 26.04) unless stated otherwise.
 
+> Version numbers below were verified against NVIDIA's documentation in **November 2026**.
+> Always double-check the linked NVIDIA pages before installing — releases move fast.
 
+---
 
-Initial Step after operating system install:
+## ⚠ Version ceilings for Pascal & Volta GPUs
 
-   1) Disable / Blacklist nouveau (default nvidia driver mostly on ubuntu)
+If your workstation has a **Volta** card (TITAN V, compute capability 7.0) or **Pascal**
+(GTX 10-series / TITAN Xp, compute capability 6.0/6.1) — this repo's workstation has a
+TITAN V alongside an RTX 3080 Ti — the current stack has hard version ceilings. **Do not
+blindly upgrade to the latest versions**: CUDA 13, TensorRT 10/11, and post-R580 drivers
+all dropped these architectures.
 
-                      sudo nautilus
-      Press Ctrl+l
-      get into /etc/modprobe.d/blacklist.conf as root
+| Component | Ceiling for Pascal/Volta | Notes |
+|-----------|--------------------------|-------|
+| NVIDIA driver | **R580 branch is the last** | The Linux 580.* series is the last to support Maxwell, Pascal, and Volta. It receives critical security updates only, through **October 2028**. Newer branches (R590+) support Turing and newer only — the TITAN V is explicitly on the affected list. |
+| CUDA Toolkit | **CUDA 12.x (12.9.2 newest)** | CUDA 13.0 removed offline compilation and library support for Pascal/Volta ("CUDA 13.0 supports all NVIDIA architectures from Turing through Grace Blackwell"). The 12.x nvcc still compiles `sm_60`/`sm_61`/`sm_70`; 13.x does not. |
+| cuDNN | **Turing (7.5) is the official minimum in cuDNN 9.x** | The cuDNN 9.28 support matrix lists only Turing and newer. In practice the cuDNN 9.x *CUDA 12* wheels still run convolutions on Volta (verified on the TITAN V of this workstation with cuDNN 9.10/CUDA 12.8) — but NVIDIA does not guarantee it, so pin a version you have tested. |
+| TensorRT | **TensorRT 8.6.1 (legacy)** | TensorRT 10.x and 11.x require **SM 7.5+ (Turing)**. The entire 10.x line never supported Volta/Pascal. On these GPUs use TensorRT 8.6.1 or skip TensorRT entirely. |
+| PyTorch | **CUDA 12.x wheels only (`cu126`/`cu128`)** | Official CUDA 12.x wheels ship `sm_50`/`sm_60`/`sm_70` kernels (verified: `torch 2.14.0+cu126` → `['sm_50', 'sm_60', 'sm_70', 'sm_75', 'sm_80', 'sm_86', 'sm_90']`). CUDA 13 wheels dropped `sm_50/60/70`. Never install PyTorch from a `cu130+` index on these GPUs. |
+| TensorFlow | **`[and-cuda]` wheels (CUDA 12.x builds)** | Official docs list compute capabilities 6.0/7.0 as supported; the wheels are built with CUDA 12.x + cuDNN 9.x, matching the ceilings above. |
 
-      add these lines at the last of the file
-      
-                      blacklist nouveau
-                      options nouveau modeset=0
-      save and close the file
-      then enter update the initramfs using this command
+**Recommended legacy stack (as running on this workstation):** driver 580.x, CUDA 12.8–12.9,
+`torch` from the `whl/cu126`/`cu128` index, `tensorflow[and-cuda]`, and no TensorRT on the
+Volta card (or TensorRT 8.6.1 if needed).
 
-                     sudo update-initramfs -u
-                     sudo reboot
+> **Mixed-GPU note:** with an Ampere card (RTX 30xx) alongside a Volta/Pascal card, CUDA 12.x
+> serves both. Moving the system to CUDA 13 would drop the legacy card entirely — the newer
+> card's extra features are not worth losing the TITAN V.
 
-      Then in Ubuntu you can open additional drivers and select the optimal nvidia drivers. Install, reboot and check the fluidity of GUI response.
-      Better use this command to install the gpu drivers. (CHECK THE VERSION & REPLACE ACCORDINGLY)
+Sources: [CUDA 13.0 release notes (architecture removal)](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html) ·
+[NVIDIA Unix driver EOL notice (a_id/3142)](https://nvidia.custhelp.com/app/answers/detail/a_id/3142) ·
+[NVIDIA driver support matrix](https://docs.nvidia.com/datacenter/tesla/drivers/cuda-toolkit-driver-and-architecture-matrix.html) ·
+[cuDNN support matrix](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/reference/support-matrix.html) ·
+[TensorRT support matrix](https://docs.nvidia.com/deeplearning/tensorrt/latest/getting-started/support-matrix.html)
 
-                     sudo apt-get install nvidia-driver-535 (Replace 525 with required or latest one)
+---
 
-      BEWARE: CHECK THE OPTIMAL DRIVERS FOR THE PARTICULAR FRAMEWORK (CUDA Version,Release,etc) IF YOUR BUIDLING THEM FROM SOURCE! MAY CAUSE BUILD FAILURES OR RUNTIME ISSUES.
+## Repository contents
 
-      **FOR TENSORFLOW & PYTORCH INSTALL FOR USE WITH PYTHON, YOU CAN CONTINUE WITH INSTALLING THE PIP WHEEL INSTALL PROVIDED BY BOTH OF THEM WITH CUDA-PYTHON INCLUDED.**
-      TensorFlow with compatible CUDA isntall pip wheel command:
+| File | Purpose |
+|------|---------|
+| `utils/gpu-fans-max.py` | Set every controllable NVIDIA GPU fan to a fixed speed (default 100%). |
+| `utils/gpu-fans-auto.py` | Return all GPU fans to the driver's automatic control. |
+| `wipeNVStuffs.sh` | Complete removal of NVIDIA drivers, CUDA, cuDNN, TensorRT and Secure Boot MOK keys (Ubuntu 24.04). |
 
-            python3 -m pip install tensorflow[and-cuda]
+### GPU fan control
 
-      Pytorch with compatible CUDA (12) install pip wheel command:
+Both scripts use NVML (`pynvml`) and require root. Install the bindings first — directly on
+the system, no venv:
 
-            pip3 install torch torchvision torchaudio
+```bash
+sudo pip3 install --break-system-packages nvidia-ml-py
+```
 
+If you keep this repo at `~/GPU-Workstation-Setup`, symlink the utils so the aliases work:
 
-      **THIS SATISFIES THE REQUIREMENT FOR BOTH OF THEM TO WORK WITH PYTHON. IF YOU PREFER HAVING SOURCE LEVEL CONTROL OVER THE FRAMEWORKS, PROCEED WITH THE FOLLOWING.**
+```bash
+ln -s ~/GPU-Workstation-Setup/utils ~/utils
+```
 
+Add these aliases to your `~/.bashrc`:
 
-      Now we have to install CUDA Tool Kit for CUDA Ops with C++/Python API support. Now the existing driver install may be replaced by the version required by the toolkit. But installing without the driver onboard can cause issues related to kernel.
-      Go to https://developer.nvidia.com/cuda-downloads and CHECK the version of the CUDA with Update release. If its too advance than your requirement kindly do google Search for the optimal version and get the link. (Eg: Nvidia cuda toolkit 12.x ubuntu )
+```bash
+alias nvFanMax='sudo python3 ~/utils/gpu-fans-max.py'
+alias nvFanAuto='sudo python3 ~/utils/gpu-fans-auto.py'
+alias nvFanSet='sudo python3 ~/utils/gpu-fans-max.py --speed'   # e.g. nvFanSet 70
+```
 
-      Select the the required architecture (x86_64 or ARM64, PowerPC) and select the distribution and the version of it.
-      Better choose the deb(local) for ubuntu and do the installation manually.
-      Follow the installation commands sequentially and complete the update and apt-get install cuda-toolkit-xx.x.
-      This is an example isntallation procedure given b nvidia for cuda toolkit 12.2 (driver 535)
+- `nvFanMax` — sets all fans to 100% (speed persists after the script exits).
+- `nvFanSet <n>` — set a specific speed (0–100).
+- `nvFanAuto` — hand control back to the driver. Run this to undo manual speeds.
 
-                  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-ubuntu2204.pin
-                  sudo mv cuda-ubuntu2204.pin /etc/apt/preferences.d/cuda-repository-pin-600
-                  wget https://developer.download.nvidia.com/compute/cuda/12.2.0/local_installers/cuda-repo-ubuntu2204-12-2-local_12.2.0-535.54.03-1_amd64.deb
-                  sudo dpkg -i cuda-repo-ubuntu2204-12-2-local_12.2.0-535.54.03-1_amd64.deb
-                  sudo cp /var/cuda-repo-ubuntu2204-12-2-local/cuda-*-keyring.gpg /usr/share/keyrings/
-                  sudo apt-get update
-                  sudo apt-get -y install cuda
+Note: on cards without controllable fans (many data-center/blower cards report none), the
+scripts print a warning and skip them. Consumer cards (e.g. RTX series) work as expected.
 
-      Now get into ~/.bashrc file (gedit ~/.bashrc) to reference the cuda version installed to the PATH so that we can use them. (VERY IMPORTANT STEP)
+### NVIDIA wipe-out (`wipeNVStuffs.sh`)
 
-            export PATH=/usr/local/cuda-<version>/bin${PATH:+:${PATH}}
+Removes every NVIDIA package, repository, config, `libcuda*` library, Secure Boot MOK keys,
+and leftover `/usr/local/cuda*` directories, then rebuilds initramfs and GRUB. Useful before a
+clean driver/CUDA reinstall. Logs to `/var/log/nvidia-wipeout-<timestamp>.log`.
 
-      Now add this line to add lib64 to the PATH (C/C++ lib for CUDA) (Change <version> according to your install)
+```bash
+sudo bash wipeNVStuffs.sh
+```
 
-            export LD_LIBRARY_PATH=/usr/local/cuda-<version>/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+**Read it before running** — it is destructive by design and assumes Ubuntu 24.04. After it
+finishes: reboot, confirm MOK key deletion in the MOK Manager if prompted, then reinstall
+the driver and toolkit, and re-enroll your MOK keys if Secure Boot is enabled:
 
-      Now save the .bashrc file and source it.
+```bash
+ls -la /var/lib/shim-signed/mok/
+sudo mokutil --import /var/lib/shim-signed/mok/MOK.der   # prompts enrollment at next boot
+```
 
-            source ~/.bashrc
+---
 
-      Now check whether nvcc (Nvidia CUDA Compiler) is active using this command. (VERY IMPORTANT!)
+## Fresh install guide
 
-            nvcc --version
+### 1) Blacklist nouveau
 
-   3) CUDNN Installation - CUDA NEURAL NETWORK lib for optimal NN performance on RTX GPUs 
+The open-source nouveau driver conflicts with the proprietary NVIDIA driver. Create
+`/etc/modprobe.d/blacklist-nouveau.conf` (as root):
 
-      Go to https://developer.nvidia.com/rdp/cudnn-download and login with nvidia developer account. (Check Archives)
-      Then find an optimal version of cudnn version with your desired framework. Can cause runtime issues if not matched properly from source.
-      You should also math the appropriate CUDA toolkit version with the cudnn installer package.
+```
+blacklist nouveau
+options nouveau modeset=0
+```
 
-      Recently NVIDIA updated the packages with CUDnn 9.0 version with generalized installation for ubuntu x86_64.
-      Just follow thorugh this installation same as the cudo-toolkit which will get you the cuda 12 version of cudnn installed.
+Then rebuild the initramfs and reboot:
 
-            wget https://developer.download.nvidia.com/compute/cudnn/9.0.0/local_installers/cudnn-local-repo-ubuntu2204-9.0.0_1.0-1_amd64.deb
-            sudo dpkg -i cudnn-local-repo-ubuntu2204-9.0.0_1.0-1_amd64.deb
-            sudo cp /var/cudnn-local-repo-ubuntu2204-9.0.0/cudnn-*-keyring.gpg /usr/share/keyrings/
-            sudo apt-get update
-            sudo apt-get -y install cudnn
+```bash
+sudo update-initramfs -u
+sudo reboot
+```
 
-      After the installation check for the libcudnn files in the /usr/lib/x86_64-linux-gnu. Then later add the x86_64-linux-gnu to the path so that your program can detect the libcudnn during compilation and execution.
+### 2) Install the NVIDIA driver
 
-            sudo find / -name libcudnn*
+Check the latest branch at <https://www.nvidia.com/en-us/drivers/> — **620.70.06** (R620)
+was the latest stable Linux driver at the time of writing. On Ubuntu the easiest route:
 
-            export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+```bash
+sudo apt-get install nvidia-driver-620   # replace with the branch available/latest for your release
+```
 
-   4) TensorRT installation.
+or use `sudo ubuntu-drivers autoinstall`. Reboot and verify:
 
-      You can prefer using the Python version of TensorRT which may support within the pip wheel installs of TensorFlow and Pytorch.** Or else ignore the first part and proceed with TensorRT 10.0 installation.**
+```bash
+nvidia-smi
+```
 
-      Install cuda-Python before TensorRT python API
+**Important:** since CUDA 13.4 the Linux CUDA Toolkit no longer bundles a driver — install
+the driver separately as above. CUDA 13.x binaries run on any driver ≥ 580 via minor-version
+compatibility; the newest CUDA 13.5 features need an R620+ driver.
 
-            pip install cuda-python==12.2.0
+> **Pascal/Volta:** R580 is the **last** driver branch for these GPUs — stay on it (it gets
+> security fixes through Oct 2028). See the legacy GPU ceilings section above.
 
-      Then proceed with the TensorRT Python API installation using pip wheel.
+> **Framework compatibility:** if you build TensorFlow/PyTorch from source, check which
+> driver/CUDA version your target framework expects first — mismatched versions cause build
+> failures or runtime issues. For plain Python usage, the pip wheels below bundle their own
+> CUDA dependencies and only need a working driver.
 
-            python3 -m pip install tensorrt
+### 3) CUDA Toolkit
 
-      Check https://docs.nvidia.com/deeplearning/tensorrt/install-guide/index.html for more insights on installation.
+Latest: **CUDA 13.5.0** (<https://developer.nvidia.com/cuda-downloads>). Install the network
+repo (replace `ubuntu2404` with `ubuntu2204`/`ubuntu2604` to match your release):
 
-      Check the TensorRT Python install using these commands and codes.
+> **Pascal/Volta:** CUDA 13 dropped these architectures. Use **CUDA 12.9.x** (or 12.8)
+> instead — same keyring method, then `apt-get -y install cuda-toolkit-12.9`. When building
+> for these GPUs pass the arch explicitly, e.g.
+> `nvcc -arch=sm_70` (TITAN V) or `-arch=sm_61` (GTX 10-series).
 
-            python3
-               import tensorrt
-               print(tensorrt.__version__)
+```bash
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get -y install cuda-toolkit
+```
 
-      If your getting any error probably could be the GPU Driver issue. Follow the guidelines provided by NVIDIA.
+Add it to your `PATH` in `~/.bashrc` (very important — adjust the version to what you
+installed):
 
-   5) TensorRT 10.0 SDK installation
+```bash
+export PATH=/usr/local/cuda-13.5/bin${PATH:+:${PATH}}
+export LD_LIBRARY_PATH=/usr/local/cuda-13.5/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+```
 
-        We can install TensorRT 10.0 for ubuntu 22.04 if your setup uses CUDA toolkit version 12.4 (Updated). This allows you to explore TensorRT using C/C++ and Python.
-      Head to https://developer.nvidia.com/tensorrt/download and find your suitable package (.DEB recommended as the zip files require manual placement of libraries which may not work as expected sometimes).
-      Then head to the Downloads section and execute the below command. (Note: You may need to change few marking on the file name so kinldy type and tab it to avoid confusions.)
+```bash
+source ~/.bashrc
+nvcc --version   # must print the toolkit version
+```
 
-            sudo dpkg -i nv-tensorrt-local-repo-ubuntu2204-10.0.1-cuda-12.4_1.0-1_amd64.deb
-            sudo cp /var/nv-tensorrt-local-repo-ubuntu2204-10.0.1-cuda-12.4/nv-tensorrt-local-2C63AABB-keyring.gpg /usr/share/keyrings/
-            sudo apt-get update
+### 4) cuDNN
 
-      Now you can proceed installing the TensorRT 10 for C++ and Python.
+Latest: **cuDNN 9.28.1** (<https://developer.nvidia.com/cudnn-downloads>, NVIDIA developer
+login required). Use the **cuDNN 9.28.1 for CUDA 13.x** package (built against CUDA 13.5,
+needs Linux driver ≥ 615.71.09) — or the CUDA 12.x package if you stayed on a CUDA 12
+toolkit. Pick the `.deb` for your Ubuntu release on the downloads page and follow the
+commands it shows (the `dpkg -i` local-repo + keyring + `apt-get install cudnn` pattern).
 
-                sudo apt-get install tensorrt
+> **Pascal/Volta:** the cuDNN 9.x support matrix officially lists Turing (7.5)+ only. The
+> CUDA 12.x wheels have been verified to still run on Volta in practice (this workstation),
+> but pin a tested version rather than upgrading freely.
 
-      Now check the installation by querying the package.
+Verify the libraries are visible to your builds:
 
-               dpkg-query -W tensorrt
+```bash
+sudo find / -name libcudnn*
+```
 
-      If you get the appropriate version of isntallation without error then your installation is successfull.
-      This will also resolve the No TensorRT issue on TensorFlow and Pytorch.
+### 5) TensorRT
 
-      
+Latest: **TensorRT 11.5.0** (<https://developer.nvidia.com/tensorrt>, downloads behind an
+NVIDIA login at <https://developer.nvidia.com/tensorrt/download>). The `.deb` packages
+require a CUDA 13.x toolkit (there are CUDA 12.x builds as well); the Python bindings
+support Python 3.11–3.14.
 
-      
-      
-           
-            
+> **Pascal/Volta:** TensorRT 10.x and 11.x require **SM 7.5+ (Turing)** — neither will run
+> on these GPUs. The last supporting release is **TensorRT 8.6.1** (listed under "Legacy
+> Versions" on the TensorRT docs page). On a Volta/Pascal workstation, skip TensorRT or use
+> 8.6.1.
 
-      
-      
+Easiest route is the pip wheel — `cuda-python` first, then TensorRT (use `tensorrt-cu13`
+for CUDA 13 stacks or `tensorrt-cu12` for CUDA 12 to pin the CUDA major version):
 
-      
-      
+```bash
+pip install cuda-python
+pip install tensorrt
+```
 
+Check the installation:
 
-      
-      
+```bash
+python3 -c "import tensorrt; print(tensorrt.__version__)"
+```
 
-        
+For the full C++/Python SDK, download the `.deb` local repo from the TensorRT download
+page and:
 
+```bash
+sudo dpkg -i nv-tensorrt-local-repo-*.deb
+sudo cp /var/nv-tensorrt-local-repo-*/nv-tensorrt-local-*-keyring.gpg /usr/share/keyrings/
+sudo apt-get update
+sudo apt-get install tensorrt
+dpkg-query -W tensorrt
+```
 
+### 6) Python frameworks (pip wheels — no source build needed)
 
+Both TensorFlow and PyTorch ship GPU wheels that bundle their CUDA dependencies, so these
+satisfy the requirement for Python usage. Only build from source if you need source-level
+control.
 
+**TensorFlow** (2.21+):
+
+```bash
+python3 -m pip install 'tensorflow[and-cuda]'
+python3 -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+```
+
+**PyTorch** — installed from PyTorch's own index; pick the CUDA build matching your driver
+(`cu128` shown; see <https://pytorch.org/get-started/locally/> for current options):
+
+> **Pascal/Volta:** only the CUDA 12.x wheel lines (`cu126`, `cu128`, `cu129`) ship
+> `sm_60`/`sm_70` kernels. Never install from a `cu130+` index on these GPUs. Check any
+> install with `python3 -c "import torch; print(torch.cuda.get_arch_list())"`.
+
+```bash
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+python3 -c "import torch; print(torch.cuda.is_available())"
+```
+
+---
+
+## References
+
+- NVIDIA driver downloads: <https://www.nvidia.com/en-us/drivers/>
+- CUDA Toolkit: <https://developer.nvidia.com/cuda-downloads> · [Install Guide (Linux)](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
+- cuDNN: <https://developer.nvidia.com/cudnn-downloads> · [Support matrix](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/reference/support-matrix.html)
+- TensorRT: <https://developer.nvidia.com/tensorrt> · [Support matrix](https://docs.nvidia.com/deeplearning/tensorrt/latest/getting-started/support-matrix.html) · [Install guide](https://docs.nvidia.com/deeplearning/tensorrt/install-guide/)
+- NVML Python bindings: <https://pypi.org/project/nvidia-ml-py/>
